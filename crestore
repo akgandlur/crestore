@@ -1,0 +1,255 @@
+#!/usr/bin/env bash
+# crestore — snapshot running Claude Code sessions and bring them back in Ghostty (2 per window, split).
+#
+#   crestore save [label]      snapshot all live interactive Claude sessions (ordered by terminal tty,
+#                             so sessions opened together stay neighbours and share a window on restore)
+#   crestore close [label]     snapshot, then quit every session and close its Ghostty pane
+#   crestore list              list snapshots, newest first (index, saved-at, count, names)
+#   crestore show [snap]       print the sessions inside a snapshot
+#   crestore [snap]            reopen a snapshot in Ghostty (default: latest). Skips sessions already running.
+#   crestore install           add the zsh hook to ~/.zshrc that lets new panes pick up restored sessions
+#
+# <snap> = nothing/"latest" | index from `crestore list` | filename or prefix | path
+# Env: CRESTORE_DIR (default ~/.claude-snapshots), CRESTORE_PER_WINDOW (2), CRESTORE_DELAY (seconds between keystrokes, 1.2)
+set -eu   # no pipefail: grep -q / head -1 in pipelines would turn SIGPIPE into failures
+
+SNAP_DIR="${CRESTORE_DIR:-$HOME/.claude-snapshots}"
+SESS_DIR="$HOME/.claude/sessions"
+PER_WINDOW="${CRESTORE_PER_WINDOW:-2}"
+DELAY="${CRESTORE_DELAY:-1.2}"
+
+die()  { printf 'crestore: %s\n' "$*" >&2; exit 1; }
+need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
+need jq
+
+# ---------- live session discovery ----------
+# prints: pid<TAB>sessionId<TAB>cwd<TAB>name<TAB>tty  for every live interactive session of this user,
+# ordered by tty number (panes opened around the same time get adjacent ttys -> they end up paired on restore)
+live_sessions() {
+  local f pid
+  [ -d "$SESS_DIR" ] || return 0
+  for f in "$SESS_DIR"/*.json; do
+    [ -e "$f" ] || continue
+    pid=$(jq -r 'select(.kind=="interactive") | .pid // empty' "$f" 2>/dev/null) || continue
+    [ -n "$pid" ] || continue
+    kill -0 "$pid" 2>/dev/null || continue                      # dead or not ours
+    case "$(ps -o comm= -p "$pid" 2>/dev/null)" in *claude*) ;; *) continue ;; esac
+    jq -r --arg tty "$(ps -o tty= -p "$pid" | tr -d ' ')" '[.pid, .sessionId, .cwd, (.name // ""), $tty] | @tsv' "$f"
+  done | awk -F'\t' 'BEGIN{OFS="\t"} {t=$5; sub(/^[a-z]+/,"",t); print t+0, $0}' | sort -n -k1,1 | cut -f2-
+}
+
+is_live_session_id() {  # $1 = sessionId
+  live_sessions | awk -F'\t' -v id="$1" '$2==id {found=1} END {exit !found}'
+}
+
+# ---------- snapshots ----------
+snap_files() { ls -1t "$SNAP_DIR"/*.tsv 2>/dev/null | grep -v '/latest\.tsv$' || true; }
+
+resolve_snap() {  # $1 = user arg -> echoes path
+  local arg="${1:-latest}" f
+  if [ -f "$arg" ]; then echo "$arg"; return; fi
+  if [ "$arg" = latest ]; then
+    f=$(snap_files | head -1); [ -n "$f" ] || die "no snapshots in $SNAP_DIR"; echo "$f"; return
+  fi
+  if [[ "$arg" =~ ^[0-9]+$ ]]; then
+    f=$(snap_files | sed -n "${arg}p"); [ -n "$f" ] || die "no snapshot #$arg"; echo "$f"; return
+  fi
+  f=$(snap_files | grep -F "/$arg" | head -1)
+  [ -n "$f" ] || f=$(snap_files | grep -F "$arg" | head -1)
+  [ -n "$f" ] || die "no snapshot matching '$arg'"
+  echo "$f"
+}
+
+cmd_save() {
+  local label="${1:-}" stamp file n
+  mkdir -p "$SNAP_DIR"
+  stamp=$(date '+%Y-%m-%d_%H-%M-%S')
+  file="$SNAP_DIR/${stamp}${label:+_$label}.tsv"
+  {
+    printf '# saved_at=%s\n' "$(date '+%Y-%m-%dT%H:%M:%S%z')"
+    printf '# columns=session_id\tcwd\tname\ttty\n'
+    live_sessions | awk -F'\t' 'BEGIN{OFS="\t"} {print $2,$3,$4,$5}'
+  } > "$file"
+  n=$(grep -vc '^#' "$file" || true)
+  [ "$n" -gt 0 ] || { rm -f "$file"; die "no live Claude sessions found — nothing saved"; }
+  ln -sfn "$file" "$SNAP_DIR/latest.tsv"
+  printf 'saved %s session(s) -> %s\n' "$n" "$file"
+  awk -F'\t' '!/^#/ {printf "  %s  %-32s %-8s %s\n", substr($1,1,8), $3, $4, $2}' "$file"
+  echo "$file"
+}
+
+cmd_list() {
+  local i=0 f n names
+  [ -n "$(snap_files)" ] || { echo "no snapshots in $SNAP_DIR"; return; }
+  printf '%-4s %-22s %-5s %s\n' '#' 'saved at' 'n' 'sessions'
+  while IFS= read -r f; do
+    i=$((i+1))
+    n=$(grep -vc '^#' "$f" || true)
+    names=$(awk -F'\t' '!/^#/ {print ($3!=""?$3:substr($1,1,8))}' "$f" | paste -sd, - | sed 's/,/, /g')
+    printf '%-4s %-22s %-5s %s\n' "$i" "$(basename "$f" .tsv)" "$n" "$names"
+  done < <(snap_files)
+}
+
+cmd_show() {
+  local f; f=$(resolve_snap "${1:-}")
+  echo "$f"; grep '^# saved_at' "$f" || true
+  awk -F'\t' '!/^#/ {printf "  %s  %-32s %-8s %s\n", substr($1,1,8), $3, $4, $2}' "$f"
+}
+
+# ---------- close ----------
+ancestor_pids() { local p=$$; while [ "$p" -gt 1 ]; do echo "$p"; p=$(ps -o ppid= -p "$p" | tr -d ' '); [ -n "$p" ] || break; done; }
+
+close_one() {  # $1 pid  $2 label
+  local pid="$1" label="$2" shell i
+  shell=$(ps -o ppid= -p "$pid" | tr -d ' ')
+  printf 'closing %-32s (pid %s)\n' "$label" "$pid"
+  kill -TERM "$pid" 2>/dev/null || true
+  for i in $(seq 1 40); do kill -0 "$pid" 2>/dev/null || break; sleep 0.25; done
+  if kill -0 "$pid" 2>/dev/null; then echo "  still alive after 10s, sending KILL"; kill -KILL "$pid" 2>/dev/null || true; sleep 0.5; fi
+  case "$(ps -o comm= -p "$shell" 2>/dev/null)" in
+    *zsh*|*bash*|*fish*) kill -HUP "$shell" 2>/dev/null || true ;;   # closes the Ghostty pane
+  esac
+}
+
+cmd_close() {
+  local file self="" line pid sid cwd name
+  file=$(cmd_save "${1:-}" | tail -1)
+  echo
+  local anc; anc=$(ancestor_pids)
+  while IFS=$'\t' read -r pid sid cwd name tty; do
+    if grep -qx "$pid" <<<"$anc"; then self="$pid	$name"; continue; fi
+    close_one "$pid" "${name:-$sid}"
+  done < <(live_sessions)
+  if [ -n "$self" ]; then
+    pid=${self%%	*}; name=${self#*	}
+    echo "closing this session last: ${name:-$pid} (pid $pid)"
+    local shell; shell=$(ps -o ppid= -p "$pid" | tr -d ' ')
+    ( sleep 4; kill -HUP "$shell" 2>/dev/null ) >/dev/null 2>&1 & disown
+    kill -TERM "$pid" 2>/dev/null || true
+  fi
+  echo "done. bring them back with: crestore"
+}
+
+# ---------- restore ----------
+# Typing commands into terminals is racy (keystrokes can land in the wrong pane). Instead, restore
+# enqueues one command per session in $QUEUE_DIR; the zsh hook installed in ~/.zshrc (crestore install)
+# makes every *new* shell claim one queued command at its first prompt. crestore then only presses
+# Cmd+N / Cmd+D in Ghostty to create enough panes.
+QUEUE_DIR="$SNAP_DIR/queue"
+
+run_osascript() {
+  local out
+  if ! out=$(osascript "$@" 2>&1); then
+    if grep -q '1002' <<<"$out"; then
+      die "macOS blocked sending keystrokes. Grant Accessibility access to the app you ran crestore from (Ghostty):
+  System Settings -> Privacy & Security -> Accessibility -> enable Ghostty, then rerun."
+    fi
+    die "osascript failed: $out"
+  fi
+}
+
+hook_installed() { grep -q 'crestore_claim' "$HOME/.zshrc" 2>/dev/null; }
+
+cmd_restore() {
+  hook_installed || die "zsh hook missing — run: crestore install"
+  local f; f=$(resolve_snap "${1:-}")
+  echo "restoring from $f"
+  local sid cwd name n=0 now
+  mkdir -p "$QUEUE_DIR"; rm -f "$QUEUE_DIR"/* 2>/dev/null || true
+  now=$(date +%s)
+  while IFS=$'\t' read -r sid cwd name _tty; do
+    [ -n "$sid" ] || continue
+    if is_live_session_id "$sid"; then echo "  skip ${name:-$sid}: already running"; continue; fi
+    if [ ! -d "$cwd" ]; then echo "  skip ${name:-$sid}: directory missing: $cwd"; continue; fi
+    n=$((n+1))
+    printf 'cd %q && claude --resume %s\n' "$cwd" "$sid" > "$QUEUE_DIR/$now.$(printf '%03d' $n)"
+    printf '  %-32s %s\n' "${name:-$sid}" "$cwd"
+  done < <(grep -v '^#' "$f")
+  [ "$n" -gt 0 ] || { echo "nothing to restore"; return; }
+
+  local windows=$(( (n + PER_WINDOW - 1) / PER_WINDOW )) running=1 script w slot key
+  # pgrep -x ghostty misses the app process, so match on ps comm (grep -c reads all input: no SIGPIPE)
+  [ "$(ps -u "$(id -u)" -o comm= | grep -ci 'Ghostty.app/Contents/MacOS/ghostty')" -gt 0 ] || running=0
+  # Every keystroke is verified: after Cmd+N / Cmd+D we wait until the new pane's shell has claimed
+  # one queue entry (queue shrinks). If it hasn't within ~8s we press the key once more.
+  script="on queued()
+return (do shell script \"ls -1 '$QUEUE_DIR' 2>/dev/null | grep -v '^\\\\.' | wc -l | tr -d ' '\") as integer
+end queued
+on waitClaim(target)
+set t to 0
+repeat while queued() > target and t < 80
+delay 0.1
+set t to t + 1
+end repeat
+return queued() <= target
+end waitClaim
+tell application \"Ghostty\" to activate
+delay 1
+tell application \"System Events\"
+tell process \"Ghostty\"
+set frontmost to true
+"
+  local remaining=$n
+  for (( w=0; w<n; w++ )); do
+    slot=$(( w % PER_WINDOW ))
+    remaining=$(( n - w - 1 ))
+    if [ $slot -eq 0 ] && [ $w -eq 0 ] && [ $running -eq 0 ]; then
+      script+="if not my waitClaim($remaining) then error \"Ghostty's first window did not claim a session\"
+"
+      continue
+    fi
+    if [ $slot -eq 0 ]; then key='"n"'; else key='"d"'; fi
+    script+="keystroke $key using command down
+if not my waitClaim($remaining) then
+keystroke $key using command down
+if not my waitClaim($remaining) then error \"pane $((w+1)) did not claim a session (queue still has \" & my queued() & \")\"
+end if
+delay 0.5
+"
+  done
+  script+='end tell
+end tell'
+  run_osascript -e "$script"
+  sleep 2
+  local left; left=$(ls -1 "$QUEUE_DIR" 2>/dev/null | wc -l | tr -d ' ')
+  if [ "$left" -gt 0 ]; then
+    echo "warning: $left session(s) still queued — open a new Ghostty pane to claim each, or run 'crestore' again in 2 min (stale entries expire)"
+  else
+    echo "opened $n session(s) across $windows window(s)"
+  fi
+}
+
+# ---------- install (zsh hook) ----------
+cmd_install() {
+  if hook_installed; then echo "zsh hook already present in ~/.zshrc"; return; fi
+  cat >> "$HOME/.zshrc" <<'ZSH'
+
+# --- crestore: a NEW shell claims one queued Claude session at its first prompt (see: crestore help) ---
+crestore_claim() {
+  add-zsh-hook -d precmd crestore_claim
+  local q=~/.claude-snapshots/queue f mine cmd now=$(date +%s)
+  [[ -d $q ]] || return 0
+  for f in $q/*(N.on); do
+    if (( now - ${${f:t}%%.*} > 120 )); then rm -f "$f"; continue; fi   # stale (>2 min) — ignore
+    mine=$q/.claimed.$$
+    mv "$f" "$mine" 2>/dev/null || continue                              # another shell took it
+    cmd=$(<"$mine"); rm -f "$mine"
+    print -P "%F{cyan}crestore:%f $cmd"; print -s -- "$cmd"
+    eval "$cmd"
+    return 0
+  done
+}
+autoload -Uz add-zsh-hook && add-zsh-hook precmd crestore_claim
+ZSH
+  echo "installed zsh hook in ~/.zshrc (new shells will claim queued restores)"
+}
+
+case "${1:-}" in
+  save)    shift; cmd_save "$@" | sed '$d' ;;
+  close)   shift; cmd_close "$@" ;;
+  list|ls) cmd_list ;;
+  show)    shift; cmd_show "$@" ;;
+  install) cmd_install ;;
+  help|-h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *)       cmd_restore "${1:-}" ;;
+esac
