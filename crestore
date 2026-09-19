@@ -21,21 +21,34 @@ DELAY="${CRESTORE_DELAY:-1.2}"
 die()  { printf 'crestore: %s\n' "$*" >&2; exit 1; }
 need() { command -v "$1" >/dev/null 2>&1 || die "missing dependency: $1"; }
 need jq
+need claude
 
 # ---------- live session discovery ----------
-# prints: pid<TAB>sessionId<TAB>cwd<TAB>name<TAB>tty  for every live interactive session of this user,
-# ordered by tty number (panes opened around the same time get adjacent ttys -> they end up paired on restore)
-live_sessions() {
-  local f pid
+# prints: pid<TAB>sessionId<TAB>cwd<TAB>name<TAB>tty<TAB>status  for every live interactive session of this user,
+# ordered by tty number (panes opened around the same time get adjacent ttys -> they end up paired on restore).
+# Source is `claude agents --json` (supported); older Claude Code without that subcommand falls back to its
+# session files, which carry the same fields minus status.
+raw_sessions() {
+  local rows f
+  if rows=$(claude agents --json 2>/dev/null) && [ -n "$rows" ]; then
+    jq -r '.[] | select(.kind=="interactive") | [.pid, .sessionId, .cwd, (.name // ""), (.status // "")] | @tsv' <<<"$rows"
+    return
+  fi
   [ -d "$SESS_DIR" ] || return 0
   for f in "$SESS_DIR"/*.json; do
     [ -e "$f" ] || continue
-    pid=$(jq -r 'select(.kind=="interactive") | .pid // empty' "$f" 2>/dev/null) || continue
+    jq -r 'select(.kind=="interactive") | [.pid, .sessionId, .cwd, (.name // ""), ""] | @tsv' "$f" 2>/dev/null || true
+  done
+}
+
+live_sessions() {
+  local pid sid cwd name status
+  while IFS=$'\t' read -r pid sid cwd name status; do
     [ -n "$pid" ] || continue
     kill -0 "$pid" 2>/dev/null || continue                      # dead or not ours
     case "$(ps -o comm= -p "$pid" 2>/dev/null)" in *claude*) ;; *) continue ;; esac
-    jq -r --arg tty "$(ps -o tty= -p "$pid" | tr -d ' ')" '[.pid, .sessionId, .cwd, (.name // ""), $tty] | @tsv' "$f"
-  done | awk -F'\t' 'BEGIN{OFS="\t"} {t=$5; sub(/^[a-z]+/,"",t); print t+0, $0}' | sort -n -k1,1 | cut -f2-
+    printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$pid" "$sid" "$cwd" "$name" "$(ps -o tty= -p "$pid" | tr -d ' ')" "$status"
+  done < <(raw_sessions) | awk -F'\t' 'BEGIN{OFS="\t"} {t=$5; sub(/^[a-z]+/,"",t); print t+0, $0}' | sort -n -k1,1 | cut -f2-
 }
 
 is_live_session_id() {  # $1 = sessionId
@@ -112,11 +125,21 @@ close_one() {  # $1 pid  $2 label
 }
 
 cmd_close() {
-  local file self="" line pid sid cwd name
+  local file self="" pid sid cwd name tty status busy ans
+  local anc; anc=$(ancestor_pids)
+  # sessions mid-task get a warning first; ask only when interactive so scripted `close` behaves as before
+  busy=$(live_sessions | awk -F'\t' -v anc="$(tr '\n' ' ' <<<"$anc")" 'BEGIN{n=split(anc,a," "); for(i=1;i<=n;i++) self[a[i]]=1}
+                                                 $6=="busy" && !($1 in self) {print "  " ($4!=""?$4:substr($2,1,8))}')
+  if [ -n "$busy" ]; then
+    printf 'busy (mid-task) sessions:\n%s\n' "$busy" >&2
+    if [ -t 0 ]; then
+      printf 'close them anyway? [y/N] ' >&2; read -r ans
+      [[ "$ans" =~ ^[Yy] ]] || die "aborted"
+    fi
+  fi
   file=$(cmd_save "${1:-}" | tail -1)
   echo
-  local anc; anc=$(ancestor_pids)
-  while IFS=$'\t' read -r pid sid cwd name tty; do
+  while IFS=$'\t' read -r pid sid cwd name tty status; do
     if grep -qx "$pid" <<<"$anc"; then self="$pid	$name"; continue; fi
     close_one "$pid" "${name:-$sid}"
   done < <(live_sessions)

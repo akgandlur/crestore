@@ -42,13 +42,14 @@ crestore install          # adds a small hook to ~/.zshrc (once)
 Restoring sends `Cmd+N` / `Cmd+D` to Ghostty through AppleScript, so Ghostty needs Accessibility access:
 System Settings → Privacy & Security → Accessibility → enable Ghostty.
 
-To uninstall: `brew uninstall crestore`, delete the `# --- crestore` block from `~/.zshrc`, and optionally
+Upgrade with `brew upgrade crestore`. To uninstall: `brew uninstall crestore`, delete the `# --- crestore` block from `~/.zshrc`, and optionally
 `rm -rf ~/.claude-snapshots`.
 
 ## How it works
 
-- Live sessions are read from Claude Code's own session files (`~/.claude/sessions/<pid>.json`): session id,
-  working directory and name. Only interactive sessions owned by you are included.
+- Live sessions come from `claude agents --json`: session id, working directory, name and whether it's busy.
+  Only interactive sessions owned by you are included. Older Claude Code without that subcommand falls back
+  to its session files (`~/.claude/sessions/<pid>.json`).
 - Sessions are saved in terminal-tty order, so panes you opened together stay neighbours and share a window
   when restored.
 - Restore never types into a terminal (keystrokes can land in the wrong pane). It queues one
@@ -58,6 +59,7 @@ To uninstall: `brew uninstall crestore`, delete the `# --- crestore` block from 
   Queue entries older than two minutes are ignored.
 - `close` sends SIGTERM to each session, waits for it to exit, then hangs up its shell so the pane closes.
   Claude Code writes its transcript as it goes, so nothing is lost and `--resume` picks up where you were.
+  If any session is busy (mid-task) it lists them and asks first; non-interactive runs just warn.
   If you run it from inside a Claude session, that one is closed last.
 
 ## Configuration
@@ -70,8 +72,5 @@ To uninstall: `brew uninstall crestore`, delete the `# --- crestore` block from 
 
 ## Requirements
 
-macOS, Ghostty with the default `super+n` (new window) / `super+d` (split right) bindings, zsh as your
-shell, `jq`.
-
-The session-file format is a Claude Code internal, not a documented API. If an update changes it, `save`
-will find no sessions until crestore is updated.
+macOS, Claude Code, Ghostty with the default `super+n` (new window) / `super+d` (split right) bindings, zsh as
+your shell, `jq`.
