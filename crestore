@@ -10,6 +10,8 @@
 #   crestore install           add the zsh hook to ~/.zshrc that lets new panes pick up restored sessions
 #
 # <snap> = nothing/"latest" | index from `crestore list` | filename or prefix | path
+# Restoring presses Cmd+N / Cmd+D in Ghostty, so the terminal app you run crestore from needs
+# Accessibility access: System Settings -> Privacy & Security -> Accessibility.
 # Env: CRESTORE_DIR (default ~/.claude-snapshots), CRESTORE_PER_WINDOW (2), CRESTORE_DELAY (seconds between keystrokes, 1.2)
 set -eu   # no pipefail: grep -q / head -1 in pipelines would turn SIGPIPE into failures
 
@@ -160,12 +162,59 @@ cmd_close() {
 # Cmd+N / Cmd+D in Ghostty to create enough panes.
 QUEUE_DIR="$SNAP_DIR/queue"
 
+# macOS only lets an app post synthetic keystrokes if it is trusted for Accessibility, and the app that
+# needs the grant is the terminal crestore runs from, not crestore itself. Without it the keystrokes are
+# dropped silently -- no error, no new pane -- so check before queueing anything and name what to enable.
+ACCESSIBILITY_PANE='x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility'
+
+term_app() {
+  case "${TERM_PROGRAM:-}" in
+    ghostty)        echo Ghostty ;;
+    iTerm.app)      echo iTerm ;;
+    Apple_Terminal) echo Terminal ;;
+    '')             echo "your terminal app" ;;
+    *)              echo "$TERM_PROGRAM" ;;
+  esac
+}
+
+accessibility_ok() {
+  [ "$(osascript -e 'tell application "System Events" to return (UI elements enabled)' 2>/dev/null)" = true ]
+}
+
+accessibility_help() {  # $1 = headline. Says what to enable, and offers to open the settings pane.
+  local app ans; app=$(term_app)
+  cat >&2 <<EOS
+crestore: $1
+
+Restoring presses Cmd+N / Cmd+D in Ghostty, and macOS only lets $app send those keystrokes if it is
+trusted for Accessibility:
+
+  System Settings -> Privacy & Security -> Accessibility -> enable $app
+
+If $app is already listed there, switch it off and on again -- the grant only reaches processes started
+afterwards, so quit and reopen $app before retrying.
+EOS
+  if [ -t 0 ] && [ -t 2 ]; then
+    printf 'open that settings pane now? [y/N] ' >&2
+    read -r ans
+    if [[ "$ans" =~ ^[Yy] ]]; then open "$ACCESSIBILITY_PANE"; fi
+  fi
+}
+
+accessibility_die() { accessibility_help "$1"; exit 1; }
+
 run_osascript() {
   local out
   if ! out=$(osascript "$@" 2>&1); then
+    # the generated script tags its own errors so they surface without the AppleScript wrapper
+    if grep -q 'crestore>accessibility' <<<"$out"; then
+      accessibility_die "no new Ghostty pane opened -- the Cmd+N keystroke never arrived."
+    fi
+    if grep -q 'crestore>' <<<"$out"; then
+      die "$(sed -e 's/.*crestore>//' -e 's/ *(-[0-9]*)$//' <<<"$out")"
+    fi
     if grep -q '1002' <<<"$out"; then
-      die "macOS blocked sending keystrokes. Grant Accessibility access to the app you ran crestore from (Ghostty):
-  System Settings -> Privacy & Security -> Accessibility -> enable Ghostty, then rerun."
+      accessibility_die "macOS blocked crestore from sending keystrokes."
     fi
     die "osascript failed: $out"
   fi
@@ -175,6 +224,7 @@ hook_installed() { grep -q 'crestore_claim' "$HOME/.zshrc" 2>/dev/null; }
 
 cmd_restore() {
   hook_installed || die "zsh hook missing — run: crestore install"
+  accessibility_ok || accessibility_die "$(term_app) is not trusted for Accessibility, so restore cannot open panes."
   local f; f=$(resolve_snap "${1:-}")
   echo "restoring from $f"
   local sid cwd name n=0 now
@@ -198,6 +248,9 @@ cmd_restore() {
   script="on queued()
 return (do shell script \"ls -1 '$QUEUE_DIR' 2>/dev/null | grep -v '^\\\\.' | wc -l | tr -d ' '\") as integer
 end queued
+on shells()
+return (do shell script \"ps -u $(id -u) -o comm= | grep zsh | wc -l | tr -d ' '\") as integer
+end shells
 on waitClaim(target)
 set t to 0
 repeat while queued() > target and t < 80
@@ -217,15 +270,19 @@ set frontmost to true
     slot=$(( w % PER_WINDOW ))
     remaining=$(( n - w - 1 ))
     if [ $slot -eq 0 ] && [ $w -eq 0 ] && [ $running -eq 0 ]; then
-      script+="if not my waitClaim($remaining) then error \"Ghostty's first window did not claim a session\"
+      script+="if not my waitClaim($remaining) then error \"crestore>Ghostty's first window did not claim a session\"
 "
       continue
     fi
     if [ $slot -eq 0 ]; then key='"n"'; else key='"d"'; fi
-    script+="keystroke $key using command down
+    script+="set s0 to my shells()
+keystroke $key using command down
 if not my waitClaim($remaining) then
 keystroke $key using command down
-if not my waitClaim($remaining) then error \"pane $((w+1)) did not claim a session (queue still has \" & my queued() & \")\"
+if not my waitClaim($remaining) then
+if my shells() <= s0 then error \"crestore>accessibility\"
+error \"crestore>pane $((w+1)) opened but its shell did not claim a session (queue still has \" & my queued() & \"). Check that the crestore hook is in ~/.zshrc and that zsh is your login shell.\"
+end if
 end if
 delay 0.5
 "
@@ -244,7 +301,9 @@ end tell'
 
 # ---------- install (zsh hook) ----------
 cmd_install() {
-  if hook_installed; then echo "zsh hook already present in ~/.zshrc"; return; fi
+  if hook_installed; then
+    echo "zsh hook already present in ~/.zshrc"
+  else
   cat >> "$HOME/.zshrc" <<'ZSH'
 
 # --- crestore: a NEW shell claims one queued Claude session at its first prompt (see: crestore help) ---
@@ -265,6 +324,13 @@ crestore_claim() {
 autoload -Uz add-zsh-hook && add-zsh-hook precmd crestore_claim
 ZSH
   echo "installed zsh hook in ~/.zshrc (new shells will claim queued restores)"
+  fi
+  if accessibility_ok; then
+    printf 'accessibility: %s can send keystrokes - restore is ready\n' "$(term_app)"
+  else
+    echo
+    accessibility_help "$(term_app) is not trusted for Accessibility yet, so restore cannot open panes."
+  fi
 }
 
 case "${1:-}" in
@@ -273,6 +339,6 @@ case "${1:-}" in
   list|ls) cmd_list ;;
   show)    shift; cmd_show "$@" ;;
   install) cmd_install ;;
-  help|-h|--help) sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//' ;;
+  help|-h|--help) sed -n '2,15p' "$0" | sed 's/^# \{0,1\}//' ;;
   *)       cmd_restore "${1:-}" ;;
 esac
