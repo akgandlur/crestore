@@ -35,9 +35,13 @@ $ crestore list
 ## Install
 
 ```
+brew trust akgandlur/tap  # Homebrew 7+ refuses formulae from third-party taps until you trust them (once)
 brew install akgandlur/tap/crestore
 crestore install          # adds a small hook to ~/.zshrc (once), and checks Accessibility
 ```
+
+If `brew install` says `Refusing to load formula akgandlur/tap/crestore from untrusted tap`, that first line
+is what's missing. Older Homebrew doesn't have `brew trust` and doesn't need it.
 
 Restoring sends `Cmd+N` / `Cmd+D` to Ghostty through AppleScript, and macOS only allows that if the
 terminal app you run crestore from is trusted for Accessibility:
