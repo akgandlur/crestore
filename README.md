@@ -36,11 +36,18 @@ $ crestore list
 
 ```
 brew install akgandlur/tap/crestore
-crestore install          # adds a small hook to ~/.zshrc (once)
+crestore install          # adds a small hook to ~/.zshrc (once), and checks Accessibility
 ```
 
-Restoring sends `Cmd+N` / `Cmd+D` to Ghostty through AppleScript, so Ghostty needs Accessibility access:
+Restoring sends `Cmd+N` / `Cmd+D` to Ghostty through AppleScript, and macOS only allows that if the
+terminal app you run crestore from is trusted for Accessibility:
 System Settings → Privacy & Security → Accessibility → enable Ghostty.
+
+macOS drops those keystrokes *silently* when the grant is missing — no error, no new pane — so crestore
+checks for it rather than letting you find out through a confusing failure. `crestore install` tells you
+where you stand, and a restore refuses up front instead of queueing sessions it cannot open. If Ghostty is
+already listed under Accessibility, switch it off and on and restart it: the grant only reaches processes
+started afterwards.
 
 Upgrade with `brew upgrade crestore`. To uninstall: `brew uninstall crestore`, delete the `# --- crestore` block from `~/.zshrc`, and optionally
 `rm -rf ~/.claude-snapshots`.
@@ -57,6 +64,9 @@ Upgrade with `brew upgrade crestore`. To uninstall: `brew uninstall crestore`, d
   **new** shell claim one entry at its first prompt. crestore only presses `Cmd+N` / `Cmd+D`, waiting for
   each pane to claim its session before moving on, and retrying a keystroke once if it didn't.
   Queue entries older than two minutes are ignored.
+- If a pane still hasn't claimed after the retry, crestore checks whether any new shell appeared at all.
+  None means the keystroke never landed and it points you at Accessibility; one that appeared but didn't
+  claim means the zsh hook isn't running, which is a different fix.
 - `close` sends SIGTERM to each session, waits for it to exit, then hangs up its shell so the pane closes.
   Claude Code writes its transcript as it goes, so nothing is lost and `--resume` picks up where you were.
   If any session is busy (mid-task) it lists them and asks first; non-interactive runs just warn.
@@ -73,4 +83,4 @@ Upgrade with `brew upgrade crestore`. To uninstall: `brew uninstall crestore`, d
 ## Requirements
 
 macOS, Claude Code, Ghostty with the default `super+n` (new window) / `super+d` (split right) bindings, zsh as
-your shell, `jq`.
+your shell, `jq`, and Accessibility access for the terminal app you run crestore from.
